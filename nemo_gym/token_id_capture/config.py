@@ -39,11 +39,18 @@ Gym writing files as well. There are two levels:
 The per-agent ``token_id_capture`` flag is a third, narrower control: it scopes
 which agents participate. Native agents leave it off because they already carry
 token ids on their response items.
+
+Where the tokens come back
+--------------------------
+``token_id_capture_delivery`` says who reads the records once a rollout finishes.
+It is independent of where they were written: a framework can install a sink and
+still let Gym read back, or leave the file store in place and read it itself.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -57,6 +64,16 @@ class TokenIdCaptureConfig(BaseModel):
     token_id_capture_dir: Path | None = None
     # Shared fallback directory (also used by evaluation capture).
     model_call_capture_dir: Path | None = None
+    # Who reads a rollout's records once it finishes.
+    #
+    # "response" is Gym: after each rollout it reads the store, builds the trajectory, replaces
+    # response.output with it, attaches the build metrics, and deletes the consumed records.
+    #
+    # "external" is the caller: Gym stops after the write. Correlation and capture stay on, and a
+    # process holding its own TokenSource reads the records through it whenever it wants them.
+    # Without this, a process that captures through its own sink still gets Gym looking in a store
+    # nothing wrote to, which warns on every rollout and reports healthy runs as failed rebuilds.
+    token_id_capture_delivery: Literal["response", "external"] = "response"
 
     @model_validator(mode="after")
     def _validate(self) -> "TokenIdCaptureConfig":

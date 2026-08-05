@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import warnings
 from asyncio import Future
 from collections import Counter
 from pathlib import Path
@@ -23,6 +24,7 @@ import pytest
 import yaml
 
 import nemo_gym.rollout_collection
+import nemo_gym.token_id_capture.delivery
 from nemo_gym.base_resources_server import AggregateMetrics, AggregateMetricsRequest
 from nemo_gym.config_types import ConfigError, ConfigPathNotFoundError
 from nemo_gym.global_config import AGENT_REF_KEY_NAME, ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
@@ -42,6 +44,25 @@ from nemo_gym.rollout_collection import (
     _rollout_request_debug_summary,
     loads_jsonl_line,
 )
+from nemo_gym.token_id_capture import TokenCaptureStore, TokenEntry, clear_token_captures_for_rollouts
+from nemo_gym.token_id_capture.delivery import (
+    MASK_SAMPLE_KEY,
+    TOKEN_CAPTURE_KEY,
+    agent_participates_in_token_capture,
+    finalize_rollout_token_capture,
+    gym_reads_back_tokens,
+)
+
+
+def test_agent_participates_in_token_capture_is_scoped_per_agent() -> None:
+    global_config = {
+        "ext_agent": {"responses_api_agents": {"claude_code_agent": {"token_id_capture": True}}},
+        "native_agent": {"responses_api_agents": {"simple_agent": {}}},
+    }
+    assert agent_participates_in_token_capture(global_config, "ext_agent") is True
+    assert agent_participates_in_token_capture(global_config, "native_agent") is False
+    assert agent_participates_in_token_capture(global_config, "missing") is False
+    assert agent_participates_in_token_capture(global_config, None) is False
 
 
 @pytest.fixture
@@ -1408,3 +1429,212 @@ class TestRolloutAggregationHelper:
         # though output_jsonl_fpath is used to derive the metrics path.
         assert not output_fpath.exists()
         assert (tmp_path / "rollouts_aggregate_metrics.json").exists()
+
+
+class TestTokenCaptureRetention:
+    """Delete-on-consume and stale-record clearing.
+
+    Both directions matter because ``TokenCaptureStore.append`` opens in "ab"
+    mode and rollout ids are deterministic: without clearing, a rerun stitches
+    the previous attempt's calls together with this one's; without deleting,
+    the capture directory grows without bound across a run.
+    """
+
+    @staticmethod
+    def _entry(rollout_id: str, mcid: str) -> TokenEntry:
+        return TokenEntry(
+            rollout_id=rollout_id,
+            model_call_id=mcid,
+            prompt_token_ids=[1, 2, 3],
+            generation_token_ids=[4, 5],
+            generation_log_probs=[-0.1, -0.2],
+        )
+
+    def test_clear_removes_stale_records_before_dispatch(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        store.append(self._entry("0-0", "old"))
+        store.mark_incomplete("0-0", "old")
+        rows = [{TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}]
+
+        clear_token_captures_for_rollouts(rows, [tmp_path])
+
+        assert store.read_entries("0-0") == []
+        assert not store.is_incomplete("0-0")
+
+    def test_clear_is_a_noop_without_capture_dirs(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        store.append(self._entry("0-0", "keep"))
+        clear_token_captures_for_rollouts([{TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}], [])
+        assert len(store.read_entries("0-0")) == 1
+
+    def test_clear_skips_rows_without_a_derivable_rollout_id(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        store.append(self._entry("0-0", "keep"))
+        clear_token_captures_for_rollouts([{"unrelated": True}], [tmp_path])
+        assert len(store.read_entries("0-0")) == 1
+
+
+class TestFinalizeRolloutTokenCapture:
+    """The per-record step that turns a finished rollout into a token-bearing one.
+
+    It is reachable on its own, rather than only from inside the collection loop,
+    because a caller that drives ``run_examples`` itself never enters
+    ``run_from_config`` and would otherwise have to reimplement the gating, the
+    build, the metrics and the retention to get the same records.
+    """
+
+    @staticmethod
+    def _config(directory: Path, **overrides) -> dict:
+        return {
+            "ext_agent": {"responses_api_agents": {"harness": {"token_id_capture": True}}},
+            "token_id_capture_enabled": True,
+            "token_id_capture_dir": str(directory),
+            **overrides,
+        }
+
+    @staticmethod
+    def _record() -> dict:
+        return {
+            TASK_INDEX_KEY_NAME: 0,
+            ROLLOUT_INDEX_KEY_NAME: 0,
+            AGENT_REF_KEY_NAME: {"name": "ext_agent"},
+            "reward": 1.0,
+            "response": {"model": "m", "output": []},
+        }
+
+    @staticmethod
+    def _capture(store: TokenCaptureStore) -> None:
+        store.append(
+            TokenEntry(
+                rollout_id="0-0",
+                model_call_id="c1",
+                prompt_token_ids=[1, 2, 3],
+                generation_token_ids=[4, 5],
+                generation_log_probs=[-0.1, -0.2],
+                output_items=[{"type": "message", "role": "assistant", "content": []}],
+                token_item_index=0,
+            )
+        )
+
+    def test_rebuilds_a_single_record_without_the_collection_loop(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        result = self._record()
+
+        finalize_rollout_token_capture(result, self._config(tmp_path))
+
+        [item] = result["response"]["output"]
+        assert item["generation_token_ids"] == [4, 5]
+        assert result["reward"] == 1.0  # the harness and verifier output is left alone
+        assert result["_ng_token_capture"]["delivered_fraction"] == 1.0
+        assert store.read_entries("0-0") == []  # consumed records are deleted
+
+    def test_external_delivery_leaves_the_record_and_the_store_alone(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        result = self._record()
+
+        with warnings.catch_warnings():
+            # A caller reading through its own transport must not be told its healthy run failed.
+            warnings.simplefilter("error")
+            finalize_rollout_token_capture(result, self._config(tmp_path, token_id_capture_delivery="external"))
+
+        assert result["response"]["output"] == []
+        assert "_ng_token_capture" not in result
+        # The records are the caller's to read and to drop, so they are still there.
+        assert len(store.read_entries("0-0")) == 1
+
+    def test_a_masked_rollout_is_flagged_at_the_top_of_the_record(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        # A call that failed to capture leaves a chain that looks contiguous but is missing a turn.
+        store.mark_incomplete("0-0", "c2")
+        result = self._record()
+
+        with pytest.warns(UserWarning, match="marked for masking"):
+            finalize_rollout_token_capture(result, self._config(tmp_path))
+
+        # Top level, so a consumer finds it without reaching into a capture-specific key.
+        assert result["mask_sample"] is True
+        assert result["_ng_token_capture"]["capture_incomplete"] is True
+
+    def test_a_healthy_rollout_is_not_flagged(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        result = self._record()
+
+        finalize_rollout_token_capture(result, self._config(tmp_path))
+
+        # Absent rather than False: a consumer that masks on presence must not mask everything.
+        assert "mask_sample" not in result
+
+    def test_an_agent_that_did_not_opt_in_is_skipped(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        result = self._record() | {AGENT_REF_KEY_NAME: {"name": "native_agent"}}
+        config = self._config(tmp_path) | {"native_agent": {"responses_api_agents": {"simple": {}}}}
+
+        with warnings.catch_warnings():
+            # A native agent carries token ids inline, so an empty store for it is not a fault.
+            warnings.simplefilter("error")
+            finalize_rollout_token_capture(result, config)
+
+        assert result["response"]["output"] == []
+        assert len(store.read_entries("0-0")) == 1
+
+    def test_a_record_with_no_capture_key_is_reported(self, tmp_path: Path) -> None:
+        result = self._record()
+        del result[TASK_INDEX_KEY_NAME]
+        del result[ROLLOUT_INDEX_KEY_NAME]
+
+        # Nothing to correlate on means a token-less rollout, which looks like a healthy one.
+        with pytest.warns(UserWarning, match="carries no id"):
+            finalize_rollout_token_capture(result, self._config(tmp_path))
+
+    def test_an_empty_store_is_reported(self, tmp_path: Path) -> None:
+        result = self._record()
+
+        with pytest.warns(UserWarning, match="no tokens were captured"):
+            finalize_rollout_token_capture(result, self._config(tmp_path))
+
+    def test_a_failed_build_keeps_its_records_and_reports_why(self, tmp_path: Path) -> None:
+        store = TokenCaptureStore(tmp_path)
+        store.append(
+            TokenEntry(
+                rollout_id="0-0",
+                model_call_id="c1",
+                prompt_token_ids=[1, 2],
+                generation_token_ids=[4, 5],
+                generation_log_probs=[-0.1],
+                output_items=[{"type": "message", "role": "assistant", "content": []}],
+                token_item_index=0,
+            )
+        )
+        result = self._record()
+
+        with pytest.warns(UserWarning, match="marked for masking"):
+            finalize_rollout_token_capture(result, self._config(tmp_path))
+
+        assert result[MASK_SAMPLE_KEY] is True
+        assert "log-prob/token length mismatch" in result[TOKEN_CAPTURE_KEY]["error"]
+        # Kept: a failed build's records are the only evidence of why it failed.
+        assert len(store.read_entries("0-0")) == 1
+
+    def test_the_process_config_is_used_when_none_is_passed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = TokenCaptureStore(tmp_path)
+        self._capture(store)
+        config = self._config(tmp_path)
+        monkeypatch.setattr(nemo_gym.token_id_capture.delivery, "get_global_config_dict", lambda: config)
+        result = self._record()
+
+        # A caller holding one finished record and nothing else can call this with just the record.
+        finalize_rollout_token_capture(result)
+
+        assert result["response"]["output"][0]["generation_token_ids"] == [4, 5]
+
+    def test_gym_reads_back_only_under_response_delivery(self, tmp_path: Path) -> None:
+        assert gym_reads_back_tokens(self._config(tmp_path)) is True
+        assert gym_reads_back_tokens(self._config(tmp_path, token_id_capture_delivery="external")) is False
+        assert gym_reads_back_tokens(self._config(tmp_path, token_id_capture_enabled=False)) is False
